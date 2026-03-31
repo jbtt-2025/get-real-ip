@@ -2,18 +2,46 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"hash"
+	"io"
 	"log"
 	"net/http"
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 )
 
-var trustedProxies []netip.Prefix
+var (
+	trustedProxies []netip.Prefix
+	signToken      string
+	hmacPool       sync.Pool
+)
 
-// initTrustedProxies 加载 CIDR，原生兼容 IPv4 和 IPv6
-func initTrustedProxies(filePath string) error {
+// initConfig 初始化配置和环境变量
+func initConfig() {
+	if err := loadTrustedProxies("proxy_cidr.txt"); err != nil {
+		log.Fatalf("Failed to load proxy_cidr.txt: %v", err)
+	}
+
+	signToken = os.Getenv("SIGN_TOKEN")
+	if signToken == "" {
+		log.Println("警告: SIGN_TOKEN 环境变量未设置，将跳过签名逻辑")
+	} else {
+		// 初始化 HMAC 对象池，极大地减少高并发下的 GC 压力
+		hmacPool = sync.Pool{
+			New: func() any {
+				return hmac.New(sha256.New, []byte(signToken))
+			},
+		}
+	}
+}
+
+func loadTrustedProxies(filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -26,97 +54,133 @@ func initTrustedProxies(filePath string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
 		prefix, err := netip.ParsePrefix(line)
 		if err != nil {
-			log.Printf("警告: 无法解析 CIDR '%s', 错误: %v", line, err)
+			log.Printf("Skip invalid CIDR: %s", line)
 			continue
 		}
 		trustedProxies = append(trustedProxies, prefix)
 	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	log.Printf("成功加载 %d 个可信 CDN CIDR (支持 IPv4/IPv6)", len(trustedProxies))
-	return nil
+	return scanner.Err()
 }
 
-// isTrustedProxy 检查 IP 是否在可信列表中 (支持 IPv4/IPv6)
+// isTrustedProxy 线性扫描检查信任列表 (由于 netip.Prefix.Contains 是位运算，百级别以内性能极高)
 func isTrustedProxy(ip netip.Addr) bool {
-	for _, prefix := range trustedProxies {
-		if prefix.Contains(ip) {
+	for i := 0; i < len(trustedProxies); i++ {
+		if trustedProxies[i].Contains(ip) {
 			return true
 		}
 	}
 	return false
 }
 
-// getRealIP 核心逻辑：从 X-Forwarded-For 中安全提取真实 IP
+// getRealIP 核心优化：零内存分配 (Zero-Allocation) 的 XFF 解析
 func getRealIP(r *http.Request) string {
-	// 1. 获取物理直连对端 IP
 	remoteAddrPort, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
-		return "" // 防御性兜底
+		return ""
 	}
 	remoteIP := remoteAddrPort.Addr()
 
-	// 2. 如果直连 IP 不在白名单中，说明它没有经过受信任的代理
-	// 直接判定它就是客户端 IP，抛弃所有 Header
 	if !isTrustedProxy(remoteIP) {
 		return remoteIP.String()
 	}
 
-	// 3. 直连 IP 可信，开始解析 X-Forwarded-For
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff == "" {
-		// 虽然来自信任代理，但没有传递 XFF，只能返回代理的 IP
 		return remoteIP.String()
 	}
 
-	ips := strings.Split(xff, ",")
 	lastValidIP := remoteIP
+	remaining := xff
 
-	// 从右向左遍历 XFF (从最靠近我们的代理开始往客户端方向回溯)
-	for i := len(ips) - 1; i >= 0; i-- {
-		ipStr := strings.TrimSpace(ips[i])
+	// 从右向左手动遍历字符串，彻底避免 strings.Split 带来的切片内存分配
+	for len(remaining) > 0 {
+		var ipStr string
+		idx := strings.LastIndexByte(remaining, ',')
+		
+		if idx == -1 {
+			// 没有逗号了，剩下的是最左边的 IP
+			ipStr = strings.TrimSpace(remaining)
+			remaining = ""
+		} else {
+			// 提取最后一个逗号右边的 IP
+			ipStr = strings.TrimSpace(remaining[idx+1:])
+			// 将游标向前移动
+			remaining = remaining[:idx]
+		}
+
+		if ipStr == "" {
+			continue
+		}
+
 		addr, err := netip.ParseAddr(ipStr)
 		if err != nil {
-			// 如果遇到格式错误的 IP（被恶意篡改或解析失败），信任链断裂。
-			// 返回上一个已知合法的节点 IP。
+			// 遇到无效格式，信任链断裂
 			return lastValidIP.String()
 		}
-
-		// 如果当前遍历到的 IP 不是信任的代理，说明我们找到了真实的客户端
 		if !isTrustedProxy(addr) {
+			// 找到非代理 IP，即真实客户端
 			return addr.String()
 		}
-
-		// 当前 IP 也是信任代理，更新最后一次看到的有效 IP，继续向左寻找
 		lastValidIP = addr
 	}
 
-	// 兜底：如果 XFF 里的所有 IP 全是受信任的代理，返回最左边的那个合法代理 IP
 	return lastValidIP.String()
+}
+
+// signIP 核心优化：复用底层加密对象，避免 fmt.Sprintf
+func signIP(ip string) string {
+	if signToken == "" {
+		return ip
+	}
+
+	// Base64 编码 (这一步由于需要生成新字符串，必须分配一次内存)
+	b64IP := base64.StdEncoding.EncodeToString([]byte(ip))
+
+	// 从对象池借出一个 HMAC 实例
+	h := hmacPool.Get().(hash.Hash)
+	
+	// 用完后清理并归还给对象池
+	defer func() {
+		h.Reset()
+		hmacPool.Put(h)
+	}()
+
+	h.Write([]byte(b64IP))
+	// hex.EncodeToString 底层也有极小的分配，但在对象池加持下已经极其高效
+	signature := hex.EncodeToString(h.Sum(nil))
+
+	// 使用原生 + 拼接，比 fmt.Sprintf 更快
+	return b64IP + "." + signature
 }
 
 func ipHandler(w http.ResponseWriter, r *http.Request) {
 	realIP := getRealIP(r)
+	if realIP == "" {
+		http.Error(w, "Unable to determine IP", http.StatusInternalServerError)
+		return
+	}
+
+	result := signIP(realIP)
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintf(w, "Your Real IP: %s\n", realIP)
+	// 使用 io.WriteString 直接写入，省去字符串到 []byte 的转换开销
+	io.WriteString(w, result)
 }
 
 func main() {
-	if err := initTrustedProxies("proxy_cidr.txt"); err != nil {
-		log.Fatalf("初始化代理列表失败: %v\n请确保当前目录下存在 proxy_cidr.txt 文件。", err)
+	initConfig()
+
+	// 禁用 Keep-Alive 中的额外开销（可选，根据你的网关架构决定）
+	// 如果前端有 Nginx 保持长连接，这里可以保留默认。
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: http.HandlerFunc(ipHandler),
 	}
 
-	http.HandleFunc("/", ipHandler)
-
-	port := "8080"
-	log.Printf("服务启动，监听端口: %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	log.Printf("Optimized Server starting on port 8080")
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
 	}
 }
