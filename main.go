@@ -42,7 +42,7 @@ func (t *IPPrefixTrie) Insert(prefix netip.Prefix) {
 		ipBytes = v4[:]
 	} else {
 		current = &t.v6Root
-		v6 := addr.As6()
+		v6 := addr.As16()
 		ipBytes = v6[:]
 	}
 
@@ -57,6 +57,7 @@ func (t *IPPrefixTrie) Insert(prefix netip.Prefix) {
 			return
 		}
 	}
+
 	current.isPrefix = true
 }
 
@@ -70,23 +71,23 @@ func (t *IPPrefixTrie) Contains(ip netip.Addr) bool {
 		ipBytes = v4[:]
 	} else {
 		current = &t.v6Root
-		v6 := ip.As6()
+		v6 := ip.As16()
 		ipBytes = v6[:]
 	}
 
 	totalBits := len(ipBytes) * 8
 	for i := 0; i < totalBits; i++ {
-		// 前置判断，完美修复 /0 边界，并实现子网段提早命中截断
 		if current.isPrefix {
 			return true
 		}
-		
+
 		bit := (ipBytes[i>>3] >> (7 - (i & 7))) & 1
 		current = current.children[bit]
 		if current == nil {
 			return false
 		}
 	}
+
 	return current.isPrefix
 }
 
@@ -114,6 +115,7 @@ func initConfig() {
 				return hmac.New(sha256.New, []byte(signToken))
 			},
 		}
+
 		bufferPool = sync.Pool{
 			New: func() any {
 				b := make([]byte, 0, 512)
@@ -136,12 +138,15 @@ func loadTrustedProxies(filePath string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
 		prefix, err := netip.ParsePrefix(line)
 		if err != nil {
 			continue
 		}
+
 		proxyTrie.Insert(prefix)
 	}
+
 	return scanner.Err()
 }
 
@@ -150,41 +155,38 @@ func getRealIP(r *http.Request, w http.ResponseWriter) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	
+
 	remoteIP := remoteAddrPort.Addr().Unmap()
 
 	if !proxyTrie.Contains(remoteIP) {
 		return remoteIP.String(), true
 	}
 
-	// 使用 Values 获取所有 XFF，防御 HTTP Header Splitting 攻击
 	xffHeaders := r.Header.Values("X-Forwarded-For")
 	if len(xffHeaders) == 0 {
 		return remoteIP.String(), true
 	}
 
-	// 严密风控：优先校验所有 XFF 头部总长度，杜绝多条小 Header 累加导致的资源耗尽
 	totalXFFLen := 0
 	for _, xff := range xffHeaders {
 		totalXFFLen += len(xff)
 	}
+
 	if totalXFFLen > MaxXFFLength {
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(http.StatusTeapot)
 		return "", false
 	}
 
 	lastValidIP := remoteIP
 	hopCount := 0
 
-	// 从最后一个 Header 开始逆向溯源
 	for hIdx := len(xffHeaders) - 1; hIdx >= 0; hIdx-- {
 		remaining := xffHeaders[hIdx]
 
-		// 零分配游标截取
 		for len(remaining) > 0 {
 			hopCount++
 			if hopCount > MaxXFFHops {
-				w.WriteHeader(http.StatusBadRequest)
+				w.WriteHeader(http.StatusTeapot)
 				return "", false
 			}
 
@@ -212,6 +214,7 @@ func getRealIP(r *http.Request, w http.ResponseWriter) (string, bool) {
 			if !proxyTrie.Contains(addr) {
 				return addr.String(), true
 			}
+
 			lastValidIP = addr
 		}
 	}
@@ -233,7 +236,6 @@ func signAndWriteResponse(w http.ResponseWriter, ip string) {
 	buf = strconv.AppendInt(buf, time.Now().UnixMilli(), 10)
 	rawPayloadEnd := len(buf)
 
-	// 严密的容量计算：计算 Base64 需要的长度 + 1 个 '.' + Hex 签名长度 + 哈希所需的冗余空间
 	b64Len := base64.StdEncoding.EncodedLen(rawPayloadEnd)
 	neededTotal := b64Len + 1 + hex.EncodedLen(sha256.Size)
 	encodeNeed := rawPayloadEnd + b64Len
@@ -247,7 +249,6 @@ func signAndWriteResponse(w http.ResponseWriter, ip string) {
 		buf = newBuf
 	}
 
-	// In-place 原地 Base64 编码
 	b64Start := rawPayloadEnd
 	buf = buf[:b64Start+b64Len]
 	base64.StdEncoding.Encode(buf[b64Start:], buf[:rawPayloadEnd])
@@ -255,20 +256,17 @@ func signAndWriteResponse(w http.ResponseWriter, ip string) {
 	h := hmacPool.Get().(hash.Hash)
 	h.Write(buf[b64Start:])
 
-	// 移位并插入 '.' 分隔符
 	copy(buf[0:b64Len], buf[b64Start:])
 	buf[b64Len] = '.'
 	buf = buf[:b64Len+1]
 
-	// 利用逃逸分析，在栈上申请固定大小数组接收哈希，杜绝堆分配和内存覆写
 	var sumBuf [sha256.Size]byte
 	sum := h.Sum(sumBuf[:0])
-	
+
 	buf = hex.AppendEncode(buf, sum)
 
 	w.Write(buf)
 
-	// 手动清理对象，拔掉 defer 开销
 	h.Reset()
 	hmacPool.Put(h)
 
@@ -281,6 +279,7 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	signAndWriteResponse(w, realIP)
 }
@@ -298,6 +297,7 @@ func main() {
 	}
 
 	log.Printf("Production Ready Radix-Trie Edge Server running...")
+
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
