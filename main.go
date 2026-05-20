@@ -12,30 +12,112 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+// RadixNode 基数树节点
+type RadixNode struct {
+	children [2]*RadixNode
+	isPrefix bool
+}
+
+// IPPrefixTrie 区分 v4/v6 的高性能前缀树
+type IPPrefixTrie struct {
+	v4Root RadixNode
+	v6Root RadixNode
+}
+
+func (t *IPPrefixTrie) Insert(prefix netip.Prefix) {
+	addr := prefix.Addr().Unmap()
+	bits := prefix.Bits()
+	var current *RadixNode
+	var ipBytes []byte
+
+	if addr.Is4() {
+		current = &t.v4Root
+		v4 := addr.As4()
+		ipBytes = v4[:]
+	} else {
+		current = &t.v6Root
+		v6 := addr.As6()
+		ipBytes = v6[:]
+	}
+
+	for i := 0; i < bits; i++ {
+		bit := (ipBytes[i>>3] >> (7 - (i & 7))) & 1
+		if current.children[bit] == nil {
+			current.children[bit] = &RadixNode{}
+		}
+		current = current.children[bit]
+
+		if current.isPrefix {
+			return
+		}
+	}
+	current.isPrefix = true
+}
+
+func (t *IPPrefixTrie) Contains(ip netip.Addr) bool {
+	var current *RadixNode
+	var ipBytes []byte
+
+	if ip.Is4() {
+		current = &t.v4Root
+		v4 := ip.As4()
+		ipBytes = v4[:]
+	} else {
+		current = &t.v6Root
+		v6 := ip.As6()
+		ipBytes = v6[:]
+	}
+
+	totalBits := len(ipBytes) * 8
+	for i := 0; i < totalBits; i++ {
+		// 前置判断，完美修复 /0 边界，并实现子网段提早命中截断
+		if current.isPrefix {
+			return true
+		}
+		
+		bit := (ipBytes[i>>3] >> (7 - (i & 7))) & 1
+		current = current.children[bit]
+		if current == nil {
+			return false
+		}
+	}
+	return current.isPrefix
+}
 
 var (
-	trustedProxies []netip.Prefix
-	signToken      string
-	hmacPool       sync.Pool
+	proxyTrie  IPPrefixTrie
+	signToken  string
+	hmacPool   sync.Pool
+	bufferPool sync.Pool
 )
 
-// initConfig 初始化配置和环境变量
+const (
+	MaxXFFLength = 4096
+	MaxXFFHops   = 32
+)
+
 func initConfig() {
 	if err := loadTrustedProxies("proxy_cidr.txt"); err != nil {
 		log.Fatalf("Failed to load proxy_cidr.txt: %v", err)
 	}
 
 	signToken = os.Getenv("SIGN_TOKEN")
-	if signToken == "" {
-		log.Println("警告: SIGN_TOKEN 环境变量未设置，将跳过签名逻辑")
-	} else {
-		// 初始化 HMAC 对象池，极大地减少高并发下的 GC 压力
+	if signToken != "" {
 		hmacPool = sync.Pool{
 			New: func() any {
 				return hmac.New(sha256.New, []byte(signToken))
+			},
+		}
+		bufferPool = sync.Pool{
+			New: func() any {
+				b := make([]byte, 0, 512)
+				return &b
 			},
 		}
 	}
@@ -56,130 +138,166 @@ func loadTrustedProxies(filePath string) error {
 		}
 		prefix, err := netip.ParsePrefix(line)
 		if err != nil {
-			log.Printf("Skip invalid CIDR: %s", line)
 			continue
 		}
-		trustedProxies = append(trustedProxies, prefix)
+		proxyTrie.Insert(prefix)
 	}
 	return scanner.Err()
 }
 
-// isTrustedProxy 线性扫描检查信任列表 (由于 netip.Prefix.Contains 是位运算，百级别以内性能极高)
-func isTrustedProxy(ip netip.Addr) bool {
-	for i := 0; i < len(trustedProxies); i++ {
-		if trustedProxies[i].Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// getRealIP 核心优化：零内存分配 (Zero-Allocation) 的 XFF 解析
-func getRealIP(r *http.Request) string {
+func getRealIP(r *http.Request, w http.ResponseWriter) (string, bool) {
 	remoteAddrPort, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	remoteIP := remoteAddrPort.Addr()
+	
+	remoteIP := remoteAddrPort.Addr().Unmap()
 
-	if !isTrustedProxy(remoteIP) {
-		return remoteIP.String()
+	if !proxyTrie.Contains(remoteIP) {
+		return remoteIP.String(), true
 	}
 
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff == "" {
-		return remoteIP.String()
+	// 使用 Values 获取所有 XFF，防御 HTTP Header Splitting 攻击
+	xffHeaders := r.Header.Values("X-Forwarded-For")
+	if len(xffHeaders) == 0 {
+		return remoteIP.String(), true
+	}
+
+	// 严密风控：优先校验所有 XFF 头部总长度，杜绝多条小 Header 累加导致的资源耗尽
+	totalXFFLen := 0
+	for _, xff := range xffHeaders {
+		totalXFFLen += len(xff)
+	}
+	if totalXFFLen > MaxXFFLength {
+		w.WriteHeader(http.StatusBadRequest)
+		return "", false
 	}
 
 	lastValidIP := remoteIP
-	remaining := xff
+	hopCount := 0
 
-	// 从右向左手动遍历字符串，彻底避免 strings.Split 带来的切片内存分配
-	for len(remaining) > 0 {
-		var ipStr string
-		idx := strings.LastIndexByte(remaining, ',')
-		
-		if idx == -1 {
-			// 没有逗号了，剩下的是最左边的 IP
-			ipStr = strings.TrimSpace(remaining)
-			remaining = ""
-		} else {
-			// 提取最后一个逗号右边的 IP
-			ipStr = strings.TrimSpace(remaining[idx+1:])
-			// 将游标向前移动
-			remaining = remaining[:idx]
-		}
+	// 从最后一个 Header 开始逆向溯源
+	for hIdx := len(xffHeaders) - 1; hIdx >= 0; hIdx-- {
+		remaining := xffHeaders[hIdx]
 
-		if ipStr == "" {
-			continue
-		}
+		// 零分配游标截取
+		for len(remaining) > 0 {
+			hopCount++
+			if hopCount > MaxXFFHops {
+				w.WriteHeader(http.StatusBadRequest)
+				return "", false
+			}
 
-		addr, err := netip.ParseAddr(ipStr)
-		if err != nil {
-			// 遇到无效格式，信任链断裂
-			return lastValidIP.String()
+			var ipStr string
+			idx := strings.LastIndexByte(remaining, ',')
+			if idx == -1 {
+				ipStr = strings.TrimSpace(remaining)
+				remaining = ""
+			} else {
+				ipStr = strings.TrimSpace(remaining[idx+1:])
+				remaining = remaining[:idx]
+			}
+
+			if ipStr == "" {
+				continue
+			}
+
+			addr, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				return lastValidIP.String(), true
+			}
+
+			addr = addr.Unmap()
+
+			if !proxyTrie.Contains(addr) {
+				return addr.String(), true
+			}
+			lastValidIP = addr
 		}
-		if !isTrustedProxy(addr) {
-			// 找到非代理 IP，即真实客户端
-			return addr.String()
-		}
-		lastValidIP = addr
 	}
 
-	return lastValidIP.String()
+	return lastValidIP.String(), true
 }
 
-// signIP 核心优化：复用底层加密对象，避免 fmt.Sprintf
-func signIP(ip string) string {
+func signAndWriteResponse(w http.ResponseWriter, ip string) {
 	if signToken == "" {
-		return ip
-	}
-
-	// Base64 编码 (这一步由于需要生成新字符串，必须分配一次内存)
-	b64IP := base64.StdEncoding.EncodeToString([]byte(ip))
-
-	// 从对象池借出一个 HMAC 实例
-	h := hmacPool.Get().(hash.Hash)
-	
-	// 用完后清理并归还给对象池
-	defer func() {
-		h.Reset()
-		hmacPool.Put(h)
-	}()
-
-	h.Write([]byte(b64IP))
-	// hex.EncodeToString 底层也有极小的分配，但在对象池加持下已经极其高效
-	signature := hex.EncodeToString(h.Sum(nil))
-
-	// 使用原生 + 拼接，比 fmt.Sprintf 更快
-	return b64IP + "." + signature
-}
-
-func ipHandler(w http.ResponseWriter, r *http.Request) {
-	realIP := getRealIP(r)
-	if realIP == "" {
-		http.Error(w, "Unable to determine IP", http.StatusInternalServerError)
+		io.WriteString(w, ip)
 		return
 	}
 
-	result := signIP(realIP)
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
 
+	buf = append(buf, ip...)
+	buf = append(buf, '|')
+	buf = strconv.AppendInt(buf, time.Now().UnixMilli(), 10)
+	rawPayloadEnd := len(buf)
+
+	// 严密的容量计算：计算 Base64 需要的长度 + 1 个 '.' + Hex 签名长度 + 哈希所需的冗余空间
+	b64Len := base64.StdEncoding.EncodedLen(rawPayloadEnd)
+	neededTotal := b64Len + 1 + hex.EncodedLen(sha256.Size)
+	encodeNeed := rawPayloadEnd + b64Len
+	if encodeNeed > neededTotal {
+		neededTotal = encodeNeed
+	}
+
+	if cap(buf) < neededTotal {
+		newBuf := make([]byte, neededTotal)
+		copy(newBuf, buf)
+		buf = newBuf
+	}
+
+	// In-place 原地 Base64 编码
+	b64Start := rawPayloadEnd
+	buf = buf[:b64Start+b64Len]
+	base64.StdEncoding.Encode(buf[b64Start:], buf[:rawPayloadEnd])
+
+	h := hmacPool.Get().(hash.Hash)
+	h.Write(buf[b64Start:])
+
+	// 移位并插入 '.' 分隔符
+	copy(buf[0:b64Len], buf[b64Start:])
+	buf[b64Len] = '.'
+	buf = buf[:b64Len+1]
+
+	// 利用逃逸分析，在栈上申请固定大小数组接收哈希，杜绝堆分配和内存覆写
+	var sumBuf [sha256.Size]byte
+	sum := h.Sum(sumBuf[:0])
+	
+	buf = hex.AppendEncode(buf, sum)
+
+	w.Write(buf)
+
+	// 手动清理对象，拔掉 defer 开销
+	h.Reset()
+	hmacPool.Put(h)
+
+	*bufPtr = buf
+	bufferPool.Put(bufPtr)
+}
+
+func ipHandler(w http.ResponseWriter, r *http.Request) {
+	realIP, ok := getRealIP(r, w)
+	if !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	// 使用 io.WriteString 直接写入，省去字符串到 []byte 的转换开销
-	io.WriteString(w, result)
+	signAndWriteResponse(w, realIP)
 }
 
 func main() {
 	initConfig()
 
-	// 禁用 Keep-Alive 中的额外开销（可选，根据你的网关架构决定）
-	// 如果前端有 Nginx 保持长连接，这里可以保留默认。
 	server := &http.Server{
-		Addr:    ":8080",
-		Handler: http.HandlerFunc(ipHandler),
+		Addr:              ":8080",
+		Handler:           http.HandlerFunc(ipHandler),
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      2 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
-	log.Printf("Optimized Server starting on port 8080")
+	log.Printf("Production Ready Radix-Trie Edge Server running...")
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
