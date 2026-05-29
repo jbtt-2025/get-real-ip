@@ -287,8 +287,13 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initConfig()
 
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8080"
+	}
+
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              listenAddr,
 		Handler:           http.HandlerFunc(ipHandler),
 		ReadHeaderTimeout: 2 * time.Second,
 		WriteTimeout:      2 * time.Second,
